@@ -4,7 +4,7 @@ root=Path(__file__).resolve().parents[1]
 spec=importlib.util.spec_from_file_location('money',root/'services/gta6_money.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 tree=ast.parse((root/'routes/gta6.py').read_text(encoding='utf8'))
 helpers=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in ['_amount','_editor_model']]
-ns={'SaveError':m.SaveError,'load_money_save':m.load,'money_limits':m.limits,'MAX_SAVE_FILES':16}
+ns={'SaveError':m.SaveError,'load_money_save':m.load,'money_limits':m.limits,'MAX_SAVE_FILES':16,'scan_in_background':lambda data:None}
 exec(compile(ast.Module(body=helpers,type_ignores=[]),'<route helpers>','exec'),ns)
 for value,want in [('10000000',10000000),('20000000',20000000),('50000000',50000000),('max','max'),(' MAX ','max'),('',None)]:assert ns['_amount'](value,'Bank',allow_max=True)==want
 assert sys.argv[1:], 'Supply decoded save ZIP fixture paths'

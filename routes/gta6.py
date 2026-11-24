@@ -10,7 +10,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-from quart import Blueprint, Response, flash, render_template, request, session
+from quart import Blueprint, Response, flash, render_template, request, session, jsonify, send_file
 
 from auth import login_required
 from config import UPLOAD_DIR
@@ -18,6 +18,7 @@ from models import get_db
 from services.files import DangerousFileError, _extract_zips_in_dir, _strip_sdimg_prefix, check_zip_safety
 from services.gta6_money import SaveError, edit_bytes, edit_zip, load as load_money_save, limits as money_limits
 from services.jobs import create_job
+from services.gta6_discovery import scan_in_background, queue_report
 
 
 gta6_bp = Blueprint("gta6", __name__)
@@ -41,6 +42,7 @@ def _cleanup_old():
 def _editor_model(path):
     saves = []
     for file_index, (name, save) in enumerate(load_money_save(path)):
+        scan_in_background(bytes(save.data))
         inventories = []
         for inventory in money_limits(bytes(save.data)):
             inventories.append({
@@ -194,6 +196,7 @@ async def _encrypt_containers(user_id, zip_bytes):
 
 
 def _download(data, filename, mimetype):
+    scan_in_background(data)
     return Response(data, mimetype=mimetype, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
@@ -267,3 +270,27 @@ async def gta6():
     except (SaveError, DangerousFileError, zipfile.BadZipFile, OSError, ValueError) as error:
         await flash(str(error), "error")
         return await render_template("gta6.html", saves=None), 400
+
+
+@gta6_bp.route("/gta6/discovery.js")
+@login_required
+async def gta6_discovery_script():
+    return await send_file(Path(__file__).resolve().parents[1] / "static/gta6-discovery.js", mimetype="text/javascript", cache_timeout=300)
+
+
+@gta6_bp.route("/gta6/discovery/contribute", methods=["POST"])
+@login_required
+async def gta6_discovery_contribute():
+    if not request.is_json or (request.content_length or 0) > 128 * 1024:
+        return jsonify({"ok": False, "error": "Small JSON discovery reports only"}), 400
+    try:
+        raw = await request.get_data()
+        if len(raw) > 128 * 1024:
+            return jsonify({"ok": False, "error": "Report too large"}), 413
+        count = await asyncio.to_thread(queue_report, json.loads(raw))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return jsonify({"ok": False, "error": "Invalid recipe metadata"}), 400
+    except Exception:
+        # The browser retains its metadata queue if the service is unavailable.
+        return jsonify({"ok": False, "error": "Discovery queue temporarily unavailable"}), 503
+    return jsonify({"ok": True, "queued": count}), 202
