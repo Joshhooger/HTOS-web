@@ -16,7 +16,7 @@ from auth import login_required
 from config import UPLOAD_DIR
 from models import get_db
 from services.files import DangerousFileError, _extract_zips_in_dir, _strip_sdimg_prefix, check_zip_safety
-from services.gta6_money import SaveError, edit_bytes, edit_zip, load as load_money_save
+from services.gta6_money import SaveError, edit_bytes, edit_zip, load as load_money_save, limits as money_limits
 from services.jobs import create_job
 
 
@@ -42,15 +42,15 @@ def _editor_model(path):
     saves = []
     for file_index, (name, save) in enumerate(load_money_save(path)):
         inventories = []
-        for number, inventory in save.inventories.items():
+        for inventory in money_limits(bytes(save.data)):
             inventories.append({
-                "number": number,
-                "name": inventory.name,
-                "bank": inventory.bank,
-                "cash": inventory.cash,
-                "items_used": inventory.items_used,
-                "max_bank": inventory.max_bank(),
-                "has_cash": bool(inventory._positions(4163145158)),
+                "number": 0,
+                "name": "Shared bank",
+                "bank": inventory["bank"],
+                "cash": inventory["cash"],
+                "items_used": inventory["items_used"],
+                "max_bank": inventory["max_bank"],
+                "has_cash": inventory["max_cash"] > 0,
             })
         saves.append({"index": file_index, "name": name or "save.jsav", "inventories": inventories})
     if len(saves) > MAX_SAVE_FILES:
@@ -58,10 +58,12 @@ def _editor_model(path):
     return saves
 
 
-def _amount(raw, label):
+def _amount(raw, label, allow_max=False):
     value = str(raw or "").replace(",", "").replace("_", "").replace("$", "").strip()
     if not value:
         return None
+    if allow_max and value.lower() == "max":
+        return "max"
     try:
         amount = int(value)
     except ValueError as error:
@@ -246,9 +248,11 @@ async def gta6():
                 raise SaveError("The editor session expired. Please upload the package again.")
             try:
                 input_path = work / "input"
-                bank = _amount(form.get("bank"), "Bank")
-                cash = _amount(form.get("cash"), "Cash")
+                bank = _amount(form.get("bank"), "Bank", allow_max=True)
+                cash = _amount(form.get("cash"), "Cash", allow_max=True)
                 character = int(form.get("character", "0"))
+                if character != 0:
+                    raise SaveError("The bank is shared; there is no separate Jason bank.")
                 data = input_path.read_bytes()
                 if zipfile.is_zipfile(input_path):
                     edited = edit_zip(data, bank=bank, cash=cash, character=character)

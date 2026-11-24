@@ -32,7 +32,7 @@ import struct
 import sys
 import zipfile
 
-__version__ = "1.3.0"
+__version__ = "1.5.1"
 
 # --- field hashes / identifiers -------------------------------------------
 K_ROOT = "$0x7a47cb05"
@@ -52,6 +52,12 @@ ID2_ECONOMY = 2084597891
 BANK_ACCOUNT_ID2 = 869874572          # the bank account item every bank slot hangs under (all saves seen)
 
 STACK_MAX = 85_000                     # game clamps any bank stack above this
+LEDGER_MAX = 2_147_483_647             # spendable ledger is a signed 32-bit value
+BANK_CEILING = 999_999_999             # highest balance this editor will set: the ledger would
+                                       # overflow past ~2.1 billion, and a known-good modded save
+                                       # sits just under 1 billion, so stay inside what's proven
+ID3_BIG_STACK = 867169743              # the bank's large-denomination item
+BIG_MAX = 1_500_000                    # game clamps one of those at 1.5M (seen 666 of them at exactly this)
 ITEM_LIMIT = 4095                      # Items index size limit per inventory
 NEW_ID1_BASE = 8489902515008300000     # id1s for new stacks start here (must be unique)
 
@@ -59,9 +65,9 @@ NEW_ID1_BASE = 8489902515008300000     # id1s for new stacks start here (must be
 SAFE_RESERVED_ITEMS = 100              # item slots always left free for items the game adds later
 SAFE_ITEM_LIMIT = ITEM_LIMIT - SAFE_RESERVED_ITEMS
 CASH_MAX = 20_000                      # highest cash value confirmed in-game
-EDITABLE_CHARACTERS = {0: "Lucia", 1: "Jason"}
+EDITABLE_CHARACTERS = {0: "Shared bank"}
 
-CHARACTER_NAMES = dict(EDITABLE_CHARACTERS)
+CHARACTER_NAMES = {0: "Shared bank", 1: "Jason (inventory only)"}
 
 
 class SaveError(Exception):
@@ -89,6 +95,8 @@ class Inventory:
         self.id1, self.type, self.id2 = _arr(t[F_ID1]), _arr(t[F_TYPE]), _arr(t[F_ID2])
         self.id3, self.value, self.flag = _arr(t[F_ID3]), _arr(t[F_VALUE]), _arr(t[F_FLAG])
         self.index = _arr(raw[K_ITEMS_INDEX])
+        self._bank_account_computed = False
+        self._bank_account_cache = None
         cols = [self.id1, self.type, self.id2, self.id3, self.value, self.flag]
         if any(c is None for c in cols) or len({len(c) for c in cols}) != 1:
             raise SaveError(f"inventory {number}: money table columns are missing or uneven")
@@ -130,13 +138,20 @@ class Inventory:
     @property
     def bank_account(self):
         """The bank account's id2: from the bank item if present, else the account most stacks sit under."""
+        if self._bank_account_computed:
+            return self._bank_account_cache
+        account = None
         for i in self._positions(ID3_BANK):
-            a = self._account_of(i)
-            if a is not None:
-                return a
-        accs = [self._account_of(i) for i in self._positions(ID3_BANK_STACK)]
-        accs = [a for a in accs if a == BANK_ACCOUNT_ID2] or [a for a in accs if a is not None]
-        return max(set(accs), key=accs.count) if accs else None
+            account = self._account_of(i)
+            if account is not None:
+                break
+        if account is None:
+            accs = [self._account_of(i) for i in self._positions(ID3_BANK_STACK) + self._positions(ID3_BIG_STACK)]
+            accs = [a for a in accs if a == BANK_ACCOUNT_ID2] or [a for a in accs if a is not None]
+            account = max(set(accs), key=accs.count) if accs else None
+        self._bank_account_cache = account
+        self._bank_account_computed = True
+        return account
 
     def _in_bank(self, i):
         acc = self.bank_account
@@ -176,24 +191,121 @@ class Inventory:
     def max_bank(self):
         """Highest bank balance allowed: existing stacks full, plus new stacks up to
         SAFE_ITEM_LIMIT items (always leaving SAFE_RESERVED_ITEMS slots free)."""
-        if self._stack_parent() is None:
+        if self._denomination()[0] is None:
             return self.bank
-        free = SAFE_ITEM_LIMIT - (self.items_used - len(self.orphan_stacks))
-        return max(self.bank, self.bank - sum(self.stacks) + STACK_MAX * (len(self.stacks) + max(free, 0)))
+        free = max(SAFE_ITEM_LIMIT - (self.items_used - len(self.orphan_stacks)), 0)
+        _, cap, _ = self._denomination()
+        bigs = [self.value[i] for i in self._positions(ID3_BIG_STACK) if self._in_bank(i)]
+        headroom = (sum(STACK_MAX - v for v in self.stacks if v < STACK_MAX)
+                    + sum(BIG_MAX - v for v in bigs if v < BIG_MAX))
+        # the spendable ledger is a signed 32-bit value, so money above that can't be spent
+        return min(max(self.bank, self.bank + headroom + cap * free), BANK_CEILING, LEDGER_MAX)
 
     def _stack_parent(self):
         """Register index that new stacks must use: the parent of an existing, correctly placed stack."""
         good = [i for i in self._positions(ID3_BANK_STACK) if self._in_bank(i)]
         return self.type[good[0]] if good else None
 
+    def _big_parent(self):
+        """Register index for large-denomination items, if this save already holds one.
+
+        These sit in their own slot under the bank account and hold up to BIG_MAX each -
+        about 17x an 85k stack - so a save that has one can reach a far higher balance
+        before running out of item slots. We never invent the slot, only reuse it."""
+        good = [i for i in self._positions(ID3_BIG_STACK) if self._in_bank(i)]
+        return self.type[good[0]] if good else None
+
+    def _denomination(self):
+        """(register index, per-item cap, id3) to use when appending new money items."""
+        big = self._big_parent()
+        if big is not None:
+            return big, BIG_MAX, ID3_BIG_STACK
+        return self._stack_parent(), STACK_MAX, ID3_BANK_STACK
+
+    def _lower_bank(self, target):
+        """Lower the bank to `target`: zero/trim bank items and remove spare stacks.
+        One stack is always kept (possibly at 0) so every bank slot keeps an item and no parent link breaks."""
+        items = [i for i in range(len(self.value)) if self.id3[i] != ID3_CASH and self._in_bank(i)]
+        stacks = [i for i in items if self.id3[i] == ID3_BANK_STACK]
+        others = [i for i in items if self.id3[i] != ID3_BANK_STACK]
+        left = target
+        for i in others:                      # bank item etc.: keep up to their current value
+            v = min(self.value[i], left); self.value[i] = v; left -= v
+        keep = []
+        for i in stacks:
+            if left > 0 or not keep:
+                v = min(STACK_MAX, left); self.value[i] = v; left -= v; keep.append(i)
+        if left > 0:
+            raise SaveError(f"{self.name}: could not lower to {target:,}")
+        drop = set(stacks) - set(keep)
+        if drop:
+            self._remove_positions(drop)
+        if self.bank != target:
+            raise SaveError(f"{self.name}: lowering check failed ({self.bank:,} != {target:,})")
+
+    def compact_bank(self):
+        """Swap 85k stacks for large-denomination items, keeping the balance identical.
+
+        A save that already holds a large-denomination item can store the same money in
+        about 1/17th of the item slots, which matters because the Items index is capped.
+        Returns the number of item slots freed (0 if this save can't do it)."""
+        big_parent = self._big_parent()
+        if big_parent is None:
+            return 0
+        stacks = [i for i in self._positions(ID3_BANK_STACK) if self._in_bank(i)]
+        if not stacks:
+            return 0
+        before_bank, before_items = self.bank, len(self.value)
+        moved = sum(self.value[i] for i in stacks)
+        # top up existing big items first, then append as few new ones as possible
+        need = moved
+        for i in self._positions(ID3_BIG_STACK):
+            if need <= 0:
+                break
+            if not self._in_bank(i):
+                continue
+            room = BIG_MAX - self.value[i]
+            if room > 0:
+                add = min(room, need)
+                self.value[i] += add
+                need -= add
+        used = set(self.id1)
+        next_id = NEW_ID1_BASE
+        while need > 0:
+            amount = min(BIG_MAX, need)
+            while next_id in used:
+                next_id += 1
+            pos = len(self.value)
+            self.id1.append(next_id); used.add(next_id)
+            self.type.append(big_parent)
+            self.id2.append(ID2_ECONOMY)
+            self.id3.append(ID3_BIG_STACK)
+            self.value.append(amount)
+            self.flag.append(False)
+            self.index.append((pos << 4) | 1)
+            need -= amount
+        # the stacks are gone only once the money is safely held elsewhere
+        self._remove_positions(set(stacks))
+        ok, why = self.check_index()
+        if not ok:
+            raise SaveError(f"{self.name}: index check failed after compacting: {why}")
+        if self.bank != before_bank:
+            raise SaveError(f"{self.name}: compacting changed the balance ({before_bank:,} -> {self.bank:,})")
+        return before_items - len(self.value)
+
     def remove_orphan_stacks(self):
         """Delete stacks with a wrong parent (the game never counts them) and re-number the Items index."""
         bad = set(self.orphan_stacks)
         if not bad:
             return 0
+        self._remove_positions(bad)
+        return len(bad)
+
+    def _remove_positions(self, bad):
+        """Delete money-table rows (never parents of other items) and re-number the Items index."""
         reg = set(self._register())
         if any(self.id1[i] in reg for i in bad):
-            raise SaveError(f"{self.name}: an orphan stack is a parent of other items; not removing")
+            raise SaveError(f"{self.name}: an item to remove is a parent of other items; not removing")
         keep = [i for i in range(len(self.value)) if i not in bad]
         newpos = {old: new for new, old in enumerate(keep)}
         t = self.raw[MONEY_TABLE]; n = len(self.id1)
@@ -212,16 +324,18 @@ class Inventory:
                 out.append(e)
         self.index[:] = out
         self._pos_cache = None
+        self._bank_account_computed = False
+        self._bank_account_cache = None
         ok, why = self.check_index()
         if not ok:
             raise SaveError(f"{self.name}: index check failed after cleanup: {why}")
-        return len(bad)
 
     def limits(self):
         return {"character": self.number, "name": self.name, "bank": self.bank, "cash": self.cash,
                 "max_bank": self.max_bank(), "max_cash": CASH_MAX if self._positions(ID3_CASH) else 0,
                 "items_used": self.items_used, "item_limit": SAFE_ITEM_LIMIT,
-                "orphan_stacks": len(self.orphan_stacks), "has_bank_stack_slot": self._stack_parent() is not None}
+                "orphan_stacks": len(self.orphan_stacks), "has_bank_stack_slot": self._denomination()[0] is not None,
+                "big_denomination": self._big_parent() is not None}
 
     def check_index(self):
         """The Items index must list every position of every table exactly once."""
@@ -241,10 +355,11 @@ class Inventory:
         current = self.bank
         if not isinstance(target, int) or isinstance(target, bool):
             raise SaveError("bank amount must be a whole number")
+        if target < 0:
+            raise SaveError("bank amount can't be negative")
         if target < current:
-            raise SaveError(f"{self.name}: lowering the balance is not supported "
-                            f"(current {current:,}, requested {target:,})")
-        if target > current and self._stack_parent() is None:
+            return self._lower_bank(target)
+        if target > current and self._denomination()[0] is None:
             raise SaveError(f"{self.name} has no bank stack yet, so there is nowhere safe to add money in this save. "
                             "The game creates one later (once the bank goes over its tier limit).")
         if target > self.max_bank():
@@ -252,19 +367,20 @@ class Inventory:
                             f"the most allowed is {self.max_bank():,} "
                             f"({SAFE_ITEM_LIMIT} items, {SAFE_RESERVED_ITEMS} kept free)")
         need = target - current
-        # 1) top up existing stacks that are below the cap
-        for i in self._positions(ID3_BANK_STACK):
-            if need <= 0:
-                break
-            if not self._in_bank(i):
-                continue
-            room = STACK_MAX - self.value[i]
-            if room > 0:
-                add = min(room, need)
-                self.value[i] += add
-                need -= add
-        # 2) append new stacks at the end of the money table + index them
-        new_type = self._stack_parent()
+        # 1) top up existing money items that are below their cap (big ones first)
+        for id3, cap in ((ID3_BIG_STACK, BIG_MAX), (ID3_BANK_STACK, STACK_MAX)):
+            for i in self._positions(id3):
+                if need <= 0:
+                    break
+                if not self._in_bank(i):
+                    continue
+                room = cap - self.value[i]
+                if room > 0:
+                    add = min(room, need)
+                    self.value[i] += add
+                    need -= add
+        # 2) append new money items at the end of the money table + index them
+        new_type, new_cap, new_id3 = self._denomination()
         if new_type is None and need > 0:
             raise SaveError(f"{self.name}: this save has no bank stack yet, so there is nowhere safe to add money. "
                             "Play until the bank shows more than its tier limit once, or add a smaller amount.")
@@ -272,14 +388,14 @@ class Inventory:
         next_id = NEW_ID1_BASE
         added = 0
         while need > 0:
-            amount = min(STACK_MAX, need)
+            amount = min(new_cap, need)
             while next_id in used:
                 next_id += 1
             pos = len(self.value)
             self.id1.append(next_id); used.add(next_id)
             self.type.append(new_type)
             self.id2.append(ID2_ECONOMY)
-            self.id3.append(ID3_BANK_STACK)
+            self.id3.append(new_id3)
             self.value.append(amount)
             self.flag.append(False)
             self.index.append((pos << 4) | 1)
@@ -394,6 +510,7 @@ class Save:
 
 
 def _as_int(v, what):
+    """Accept 66966966, "66,966,966", "$66,966,966" or "66_966_966"."""
     try:
         s = str(v).replace(",", "").replace("_", "").replace("$", "").strip()
         if not s.lstrip("-").isdigit():
@@ -405,7 +522,98 @@ def _as_int(v, what):
 
 def limits(data: bytes):
     """Current values and allowed maximums per character, for a decrypted save."""
-    return Save(data).limits()
+    _check_header(data)
+    original = Save(data).limits()
+    try:
+        probe = Save(_prepare_shared_bank(data)).limits()[0]
+        for key in ("max_bank", "has_bank_stack_slot", "big_denomination"):
+            original[0][key] = probe[key]
+    except SaveError as exc:
+        original[0]["bank_unavailable_reason"] = str(exc)
+    original[0]["shared_bank"] = True
+    original[0]["cash_label"] = "Cash (Lucia)"
+    return original
+
+
+
+# ---------- bank ledger (block with $0x1e1e8a08): the game approves spending against its last balance ----------
+K_LEDGER = '"$0x1e1e8a08":['
+LEDGER_MAX_ENTRIES = 100
+
+
+def _ledger_info(data):
+    """(block index, list of (start,end) entry spans, block text) or None if the save has no ledger."""
+    n_code, n_script = struct.unpack_from("<II", data, 8)
+    for i in range(n_code + n_script):
+        _, _, _, o, sz = struct.unpack_from("<IIIII", data, 16 + 20 * i)
+        raw = bytes(data[o:o + sz])
+        if K_LEDGER.encode() not in raw:
+            continue
+        text = raw.decode("utf-8"); k = text.index(K_LEDGER) + len(K_LEDGER)
+        spans, depth, start, j, instr = [], 0, None, k, False
+        while True:
+            ch = text[j]
+            if instr:
+                if ch == "\\": j += 2; continue
+                if ch == '"': instr = False
+            elif ch == '"': instr = True
+            elif ch == "{":
+                if depth == 0: start = j
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0: spans.append((start, j + 1))
+            elif ch == "]" and depth == 0:
+                return i, spans, text, j
+            j += 1
+    return None
+
+
+def ledger_balance(data):
+    info = _ledger_info(data)
+    if not info or not info[1]:
+        return None
+    i, spans, text, _ = info
+    return json.loads(text[spans[-1][0]:spans[-1][1]])["$0x818f6f6d"]
+
+
+def sync_ledger(data: bytes, new_balance: int) -> bytes:
+    """Append one deposit/withdrawal so the ledger's last balance equals `new_balance` (Lucia's bank).
+    Copies the game's own entry layout, next sequence number, keeps the newest 100 entries."""
+    info = _ledger_info(data)
+    if not info or not info[1]:
+        raise SaveError("this save has no bank ledger; can't keep spending in step")
+    bi, spans, text, end = info
+    last = json.loads(text[spans[-1][0]:spans[-1][1]])
+    old_bal = last["$0x818f6f6d"]
+    if old_bal == new_balance:
+        return bytes(data)
+    if not (0 <= new_balance < 2 ** 31):
+        raise SaveError("ledger balance must be between 0 and 2,147,483,647")
+    seq = max(json.loads(text[a:b])["$0x9d8e7980"] for a, b in spans)
+    entry = ('{"$0x9d8e7980":%d,"$0x6d0bd92f":3221225474,"$0xf0e40798":{"$data":"0x00000000"},'
+             '"$0x37f7ebed":{"$data":"0x00000000"},"$0xd876c338":{"$data":"0x00000000"},'
+             '"$0xcfcdc72c":0,"$0x706a1287":0,"$0xa662d8be":%d,"$0x818f6f6d":%d}') % (seq + 1, new_balance - old_bal, new_balance)
+    if list(json.loads(entry)) != list(last):
+        raise SaveError("ledger entries in this save have an unknown layout; not editing")
+    first = 1 if len(spans) >= LEDGER_MAX_ENTRIES else 0
+    body = text[spans[first][0]:spans[-1][1]] + "," + entry
+    new_text = text[:spans[0][0]] + body + text[end:]
+    json.loads(new_text)
+    nb = new_text.encode("utf-8")
+    _, _, _, off, size = struct.unpack_from("<IIIII", data, 16 + 20 * bi)
+    delta = len(nb) - size
+    out = bytearray(bytes(data[:off]) + nb + bytes(data[off + size:]))
+    n_code, n_script = struct.unpack_from("<II", data, 8)
+    for i in range(n_code + n_script):
+        a, b_, c, o, sz = struct.unpack_from("<IIIII", data, 16 + 20 * i)
+        if i == bi: sz += delta
+        elif o > off: o += delta
+        struct.pack_into("<IIIII", out, 16 + 20 * i, a, b_, c, o, sz)
+    _check_header(bytes(out))
+    if ledger_balance(bytes(out)) != new_balance:
+        raise SaveError("ledger check failed")
+    return bytes(out)
 
 
 def _check_header(data: bytes):
@@ -423,6 +631,80 @@ def _check_header(data: bytes):
                         f"(first: block {bad[0]}). Another tool probably edited it. Start from an untouched save.")
 
 
+def _prepare_shared_bank(data):
+    """Activate only observed, existing empty bank slots; never invent an account."""
+    s = Save(data)
+    inv = s.inventory(0)
+    if inv._denomination()[0] is not None:
+        return bytes(data)
+    fields = {F_ID1, F_TYPE, F_ID2, F_ID3, F_VALUE, F_FLAG}
+    if set(inv.raw[MONEY_TABLE]) != fields:
+        raise SaveError("Unsupported shared bank table layout")
+    accounts = [i for i, x in enumerate(inv.id2)
+                if x == BANK_ACCOUNT_ID2 and inv.id3[i] == 3359303526]
+    if len(accounts) != 1:
+        raise SaveError("This save needs one existing shared bank account; no account was created")
+    account = accounts[0]
+    def slot(spec):
+        found = [i for i, x in enumerate(inv.id2) if x == spec
+                 and inv.id3[i] == 1490883802 and inv._parent_pos(i) == account]
+        if len(found) != 1:
+            raise SaveError("Missing or ambiguous native shared bank slot; no slot was created")
+        return found[0]
+    overflow = slot(864635288)
+    base = slot(642088078)
+    used = set()
+    for raw in s.block[K_ROOT][K_PARENT][K_INVENTORIES]:
+        if isinstance(raw, dict):
+            for t in TABLES:
+                if isinstance(raw.get(t), dict):
+                    used.update(_arr(raw[t].get(F_ID1)) or [])
+    next_id = max([x for x in used if x >= 0] + [8_600_000_000_000_000_000]) + 1
+    reg = inv._register()
+    def add(parent, category):
+        nonlocal next_id
+        if len(inv.index) >= SAFE_ITEM_LIMIT or next_id >= 2**63:
+            raise SaveError("Not enough safe inventory capacity to activate the shared bank")
+        item = inv.id1[parent]
+        if item not in reg:
+            reg.append(item)
+        values = {F_ID1: next_id, F_TYPE: reg.index(item), F_ID2: ID2_ECONOMY,
+                  F_ID3: category, F_VALUE: 0, F_FLAG: False}
+        pos = len(inv.id1)
+        for key, col in inv.raw[MONEY_TABLE].items():
+            _arr(col).append(values[key])
+        inv.index.append((pos << 4) | 1)
+        next_id += 1
+    if not inv._positions(ID3_BANK):
+        add(base, ID3_BANK)
+    add(overflow, ID3_BANK_STACK)
+    ok, why = inv.check_index()
+    if not ok:
+        raise SaveError("Bank activation index check failed: " + why)
+    return s.to_bytes()
+
+
+MONEY_PRESETS = (("10 Million", 10_000_000), ("20 Million", 20_000_000),
+                 ("50 Million", 50_000_000), ("Max Money", "max"))
+
+
+def money_presets(data):
+    """Button descriptors; disabled amounts never silently clamp to another amount."""
+    info = limits(data)[0]
+    return [{"label": label, "value": value,
+             "enabled": info["has_bank_stack_slot"] and
+                 (value == "max" or value <= info["max_bank"])}
+            for label, value in MONEY_PRESETS]
+
+
+def edit_preset_bytes(data, preset):
+    """Apply a supported shared-bank button; leave both characters' cash alone."""
+    values = {str(value): value for _, value in MONEY_PRESETS}
+    if str(preset) not in values:
+        raise SaveError("Choose 10 Million, 20 Million, 50 Million or Max Money")
+    return edit_bytes(data, bank=values[str(preset)])
+
+
 def edit_bytes(data: bytes, bank=None, cash=None, character=0) -> bytes:
     """One-call API for integrations: returns the EDITED save bytes, already verified.
 
@@ -432,6 +714,29 @@ def edit_bytes(data: bytes, bank=None, cash=None, character=0) -> bytes:
     """
     if bank is None and cash is None:
         raise SaveError("no edit requested (pass bank and/or cash)")
+    character = _as_int(character, "character")
+    if character != 0:
+        raise SaveError("The bank is shared. Use character=0; there is no separate Jason bank")
+    _check_header(data)
+    original_data = bytes(data)
+    if bank is not None:
+        # This path reuses native empty slots found in both controlled input saves.
+        data = _prepare_shared_bank(data)
+    # bank="max": use this save's own safe maximum (what a "Max money" button should call).
+    if isinstance(bank, str) and bank.strip().lower() == "max":
+        _check_header(data)
+        info = limits(data)[character]
+        if not info["has_bank_stack_slot"]:
+            raise SaveError(f"{info['name']} has no bank stack yet, so there is nowhere safe to add money in this save.")
+        if info.get("big_denomination"):
+            probe = Save(data).inventory(character)
+            probe.compact_bank()
+            info = dict(info, max_bank=probe.max_bank())
+        bank = info["max_bank"] // 1_000_000 * 1_000_000   # round down to a whole million
+        if bank <= info["bank"]:
+            bank = info["bank"]  # Max never lowers money or changes on a second click
+    if isinstance(cash, str) and cash.strip().lower() == "max":
+        cash = CASH_MAX
     bank = None if bank is None else _as_int(bank, "bank")
     cash = None if cash is None else _as_int(cash, "cash")
     character = _as_int(character, "character")
@@ -445,11 +750,18 @@ def edit_bytes(data: bytes, bank=None, cash=None, character=0) -> bytes:
             raise
         except Exception:
             pass
-    if bank is not None:
+    if bank is not None and bank != inv.bank:
+        # Large-denomination items hold ~17x an 85k stack. If the target needs more item
+        # slots than are left, swap existing stacks for them first - same balance, far fewer items.
+        if bank > inv.bank and inv._big_parent() is not None and bank > inv.max_bank():
+            inv.compact_bank()
         inv.set_bank(bank)
     if cash is not None:
         inv.set_cash(cash)
     out = s.to_bytes()
+    # keep the bank ledger in step (Lucia's bank): the game only lets you spend what the ledger says
+    if bank is not None and character == 0 and ledger_balance(out) not in (None, bank):
+        out = sync_ledger(out, bank)
     check = Save(out).inventory(character)
     if bank is not None and check.bank != int(bank):
         raise SaveError(f"verification failed: bank is {check.bank:,}, expected {int(bank):,}")
@@ -459,7 +771,8 @@ def edit_bytes(data: bytes, bank=None, cash=None, character=0) -> bytes:
     if not ok:
         raise SaveError(f"verification failed: {why}")
     if out == bytes(data):
-        raise SaveError("verification failed: output is identical to input")
+        # The requested balance already exists. A verified no-op is valid.
+        return bytes(data)
     return out
 
 
@@ -484,11 +797,7 @@ def edit_zip(zip_bytes: bytes, bank=None, cash=None, character=0) -> bytes:
 # --- file / zip helpers -----------------------------------------------------
 def _is_save_member(name, data):
     base = name.rsplit("/", 1)[-1]
-    if "/sce_sys/" in f"/{name}" or base.startswith("chives."):
-        return False
-    if data[:4] == b"JSAV":
-        return True
-    return data[:4] == b"ASAV" and len(data) > 0x14 and bool(data[0x10] & 0x80)
+    return "/sce_sys/" not in f"/{name}" and not base.startswith("chives.") and data[:4] in (b"JSAV", b"ASAV")
 
 
 def load(path):
@@ -522,13 +831,16 @@ def write(path_in, path_out, edited):
 
 
 def _parse_amount(s):
+    """CLI amounts: a number (commas/$ allowed) or the word "max"."""
+    if str(s).strip().lower() == "max":
+        return "max"
     return int(str(s).replace(",", "").replace("_", "").replace("$", ""))
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Set the bank balance in a decrypted GTA VI PS5 story save.")
     ap.add_argument("input", help="decrypted save file (SARCxxxx / memory.dat) or GarlicSaves decrypt .zip")
-    ap.add_argument("--bank", type=_parse_amount, help="new bank balance, e.g. 66966966 or 66,966,966")
+    ap.add_argument("--bank", type=_parse_amount, help="new bank balance, e.g. 66966966, 66,966,966, or max (this save's safe maximum)")
     ap.add_argument("--cash", type=_parse_amount, help="new cash on hand (only if the character already has cash)")
     ap.add_argument("--character", type=int, default=0, help="inventory to edit: 0 = Lucia (default), 1 = Jason")
     ap.add_argument("-o", "--output", help="output path (default: <input>.edited[.zip])")
@@ -542,14 +854,10 @@ def main(argv=None):
             return 0
         edited = {}
         for name, s in saves:
-            inv = s.inventory(a.character)
-            if a.bank is not None:
-                added = inv.set_bank(a.bank)
-                print(f"-> {inv.name}: bank set to {inv.bank:,} ({added} new stacks)")
-            if a.cash is not None:
-                inv.set_cash(a.cash)
-                print(f"-> {inv.name}: cash set to {inv.cash:,}")
-            edited[name] = s.to_bytes()
+            # Same path as integrations: dead-stack cleanup, raise/lower, ledger kept in step, verified.
+            edited[name] = edit_bytes(bytes(s.data), bank=a.bank, cash=a.cash, character=a.character)
+            inv = Save(edited[name]).inventory(a.character)
+            print(f"-> {inv.name}: bank {inv.bank:,}, cash {inv.cash:,}, ledger {ledger_balance(edited[name])}")
         root, ext = os.path.splitext(a.input)
         out = a.output or (root + ".edited" + (ext if ext.lower() == ".zip" else ""))
         write(a.input, out, edited)

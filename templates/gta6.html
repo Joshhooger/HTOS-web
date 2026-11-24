@@ -3,7 +3,7 @@
 {% block meta_description %}Basic GTA VI bank and cash editor for decrypted PS5 and Xbox saves, made by some asshole.{% endblock %}
 {% block content %}
 <h1>GTA VI Money Editor</h1>
-<p>Set bank balances and cash in decrypted GTA VI saves. <strong>made by some asshole</strong></p>
+<p>Set the shared bank balance and optional cash in decrypted GTA VI saves. <strong>made by some asshole</strong></p>
 <p><a href="/gta6/cars">Open the GTA VI Car Giver</a></p>
 <p class="flash flash-warning">Save modding is at your own risk, including bans, account or console enforcement, data loss, and corrupted saves. <a href="{{ url_for('main.disclaimer') }}">Read the full disclaimer</a>.</p>
 
@@ -11,7 +11,7 @@
 <section class="panel">
     <h2>Open decrypted save data</h2>
     <p>Upload a decrypted ZIP from the PS5 or Xbox tools, or a single JSAV file. Keep all metadata files in the ZIP.</p>
-    <p><small>Bank balances can only be increased. Cash can be edited only when the character already has a cash item. Always keep a backup.</small></p>
+    <p><small>Lucia and Jason use one shared bank balance. Cash editing refers to Lucia and requires an existing cash item. Always keep a backup.</small></p>
     <form method="POST" enctype="multipart/form-data" class="operation-form">
         <input type="hidden" name="action" value="load">
         <div class="file-drop">
@@ -25,48 +25,64 @@
     </form>
 </section>
 {% else %}
-<form method="POST" class="operation-form">
+<form method="POST" class="operation-form" id="money-form">
     <input type="hidden" name="edit_id" value="{{ edit_id }}">
-    {% for save in saves %}
+    <input type="hidden" name="character" value="0">
+    <input type="hidden" name="bank" id="shared-bank" value="">
+    <input type="hidden" name="cash" id="shared-cash" value="">
     <section class="panel">
-        <h2>{{ save.name }}</h2>
-        <table>
-            <thead><tr><th>Character</th><th>Current bank</th><th>Current cash</th><th>Maximum bank</th><th>Items</th></tr></thead>
-            <tbody>
-            {% for inventory in save.inventories %}
-                <tr>
-                    <td>{{ inventory.name }}</td>
-                    <td>{{ "{:,}".format(inventory.bank) }}</td>
-                    <td>{{ "{:,}".format(inventory.cash) }}</td>
-                    <td>{{ "{:,}".format(inventory.max_bank) }}</td>
-                    <td>{{ inventory.items_used }}/4095</td>
-                </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-    </section>
-    {% endfor %}
-    <section class="panel">
-        <h2>Set new values</h2>
-        <label>Character
-            <select name="character">
-                <option value="0">Lucia</option>
-                <option value="1">Jason</option>
-            </select>
-        </label>
-        <div class="inline-form">
-            <label>New bank balance
-                <input type="text" inputmode="numeric" name="bank" placeholder="Increase only">
-            </label>
-            <label>New cash amount (optional)
-                <input type="text" inputmode="numeric" name="cash" placeholder="Only if cash already exists">
-            </label>
+        <h2>Your money</h2>
+        {% for save in saves %}
+        {% if saves|length > 1 %}<h3>Save {{ save.index + 1 }}</h3>{% endif %}
+        {% for inventory in save.inventories %}
+        <p>Bank: <strong>${{ "{:,}".format(inventory.bank) }}</strong>
+           &nbsp; Cash: <strong>${{ "{:,}".format(inventory.cash) }}</strong></p>
+        {% endfor %}
+        {% endfor %}
+        <h2>Choose your money</h2>
+        <div class="money-presets" role="group" aria-label="Bank amount">
+            <button type="button" data-bank-preset="10000000" aria-pressed="false">$10 Million</button>
+            <button type="button" data-bank-preset="20000000" aria-pressed="false">$20 Million</button>
+            <button type="button" data-bank-preset="50000000" aria-pressed="false">$50 Million</button>
+            <button type="button" data-bank-preset="max" aria-pressed="false">Max Money</button>
+            <button type="button" id="max-cash" aria-pressed="false">Max Cash</button>
         </div>
-        <p><small>Bank can only be increased and always leaves 100 item slots free for future game items. Cash is capped at $20,000 and can be changed only if the selected character already has a cash item.</small></p>
-        <button type="submit" name="action" value="encrypt">Edit and Encrypt</button>
-        <button type="submit" name="action" value="save" class="secondary">Download Edited Data</button>
-        <p><small>Edit and Encrypt uses the account ID stored in the save and returns encrypted containers for both slot and autosave when present. Raw JSAV downloads must be encrypted manually.</small></p>
+        <p id="money-choice" role="status" aria-live="polite">Choose a bank amount, Max Cash, or both.</p>
+        <button type="submit" name="action" value="encrypt" data-money-submit disabled>Edit and Encrypt</button>
+        <button type="submit" name="action" value="save" class="secondary" data-money-submit disabled>Download Edited Data</button>
+        <p><small>One shared bank for both characters. Max Cash sets cash to $20,000. Your original upload stays unchanged.</small></p>
     </section>
 </form>
+<script>
+(() => {
+    const bank = document.getElementById('shared-bank');
+    const cash = document.getElementById('shared-cash');
+    const maxCash = document.getElementById('max-cash');
+    const status = document.getElementById('money-choice');
+    const buttons = [...document.querySelectorAll('[data-bank-preset]')];
+    function selected() {
+        for (const button of buttons) {
+            button.setAttribute('aria-pressed', String(bank.value === button.dataset.bankPreset));
+        }
+        maxCash.setAttribute('aria-pressed', String(cash.value === 'max'));
+        const parts = [];
+        if (bank.value) parts.push(bank.value === 'max' ? 'Bank: maximum for this save' : 'Bank: $' + Number(bank.value).toLocaleString());
+        if (cash.value) parts.push('Cash: $20,000');
+        status.textContent = parts.length ? parts.join(' · ') : 'Choose a bank amount, Max Cash, or both.';
+        for (const button of document.querySelectorAll('[data-money-submit]')) button.disabled = !parts.length;
+    }
+    for (const button of buttons) {
+        button.addEventListener('click', () => {
+            bank.value = button.dataset.bankPreset;
+            selected();
+        });
+    }
+    maxCash.addEventListener('click', () => {
+        cash.value = cash.value === 'max' ? '' : 'max';
+        selected();
+    });
+    selected();
+})();
+</script>
 {% endif %}
 {% endblock %}
